@@ -1,0 +1,8 @@
+﻿numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+torch>=2.2
+sgp4>=2.23
+jpype1>=1.5
+orekit-jpype>=13.1.2
