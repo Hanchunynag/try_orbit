@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shlex
@@ -36,6 +38,18 @@ def build_sweep_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sweep_seed", type=int, default=42)
     parser.add_argument("--sweep_resume", action="store_true")
     parser.add_argument("--sweep_top_k", type=int, default=5)
+    parser.add_argument(
+        "--sweep_parallel_trials",
+        type=int,
+        default=None,
+        help="Number of trials to run concurrently. If --sweep_gpu_ids is given and this is omitted, it defaults to the number of listed GPUs.",
+    )
+    parser.add_argument(
+        "--sweep_gpu_ids",
+        nargs="+",
+        default=None,
+        help="Optional GPU ids used to pin concurrent trials, e.g. --sweep_gpu_ids 0 1.",
+    )
     parser.add_argument(
         "--sweep_objective",
         choices=["corrected_3d_rmse", "improvement_percent"],
@@ -215,6 +229,25 @@ def trial_command(
     ]
 
 
+def build_worker_bindings(sweep_args: argparse.Namespace) -> list[str | None]:
+    """Resolve the concurrent worker slots and optional GPU pinning."""
+    if sweep_args.sweep_gpu_ids:
+        gpu_ids = [str(gpu_id) for gpu_id in sweep_args.sweep_gpu_ids]
+        parallel_trials = sweep_args.sweep_parallel_trials or len(gpu_ids)
+        if parallel_trials <= 0:
+            raise ValueError("--sweep_parallel_trials must be positive.")
+        if parallel_trials > len(gpu_ids):
+            raise ValueError(
+                f"--sweep_parallel_trials={parallel_trials} exceeds the number of provided --sweep_gpu_ids ({len(gpu_ids)})."
+            )
+        return gpu_ids[:parallel_trials]
+
+    parallel_trials = sweep_args.sweep_parallel_trials or 1
+    if parallel_trials <= 0:
+        raise ValueError("--sweep_parallel_trials must be positive.")
+    return [None] * parallel_trials
+
+
 def resolve_shared_bundle_path(sweep_root: Path, base_main_namespace: argparse.Namespace) -> Path:
     """Resolve the bundle path used across all sweep trials."""
     if base_main_namespace.precomputed_bundle_path:
@@ -268,6 +301,7 @@ def run_trial(
     trial_root: Path,
     trial: dict[str, Any],
     objective_name: str,
+    device_binding: str | None = None,
 ) -> dict[str, Any]:
     """Run one trial and return the summary row."""
     trial_id = f"trial_{trial['trial_index']:03d}"
@@ -281,6 +315,9 @@ def run_trial(
         trial=trial,
     )
     started_at = time.time()
+    env = os.environ.copy()
+    if device_binding is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(device_binding)
     completed = subprocess.run(
         command,
         cwd=str(repo_root),
@@ -288,6 +325,7 @@ def run_trial(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
     duration_sec = time.time() - started_at
 
@@ -300,6 +338,7 @@ def run_trial(
         "returncode": completed.returncode,
         "duration_sec": round(duration_sec, 3),
         "output_dir": str(trial_dir),
+        "assigned_gpu": device_binding if device_binding is not None else "default",
         "command": shlex.join(command),
         **trial,
     }
@@ -344,6 +383,7 @@ def main() -> None:
     results_csv_path = sweep_root / "results.csv"
     best_json_path = sweep_root / "best_trial.json"
     shared_bundle_path = resolve_shared_bundle_path(sweep_root=sweep_root, base_main_namespace=base_main_namespace)
+    worker_bindings = build_worker_bindings(sweep_args)
 
     if manifest_path.exists():
         if not sweep_args.sweep_resume:
@@ -381,29 +421,56 @@ def main() -> None:
         existing_rows = {row["trial_id"]: row for row in previous_rows}
 
     all_rows: list[dict[str, Any]] = []
+    pending_trials: list[dict[str, Any]] = []
     for trial in trials:
         trial_id = f"trial_{trial['trial_index']:03d}"
         if sweep_args.sweep_resume and trial_id in existing_rows and existing_rows[trial_id].get("status") == "SUCCESS":
             print(f"[resume] skipping completed {trial_id}")
             all_rows.append(existing_rows[trial_id])
             continue
+        pending_trials.append(trial)
 
-        print(
-            f"[run] {trial_id} | activation={trial['narx_activation']} | layers={trial['narx_num_hidden_layers']} "
-            f"| nodes={trial['narx_hidden_dim']} | pred_len={trial['narx_prediction_length_sec']} s | opt={trial['optimizer_name']}"
-        )
-        row = run_trial(
-            repo_root=repo_root,
-            base_main_args=main_arg_tokens,
-            precomputed_bundle_path=shared_bundle_path,
-            trial_root=trial_root,
-            trial=trial,
-            objective_name=sweep_args.sweep_objective,
-        )
-        all_rows.append(row)
-        ordered_rows = sort_rows(all_rows, sweep_args.sweep_objective)
-        save_json(ordered_rows, str(results_json_path))
-        save_results_csv(ordered_rows, results_csv_path)
+    gpu_summary = ", ".join("default" if binding is None else str(binding) for binding in worker_bindings)
+    print(f"[sweep] parallel_trials={len(worker_bindings)} | workers={gpu_summary}")
+
+    available_bindings = list(worker_bindings)
+    in_flight: dict[Any, str | None] = {}
+    with ThreadPoolExecutor(max_workers=len(worker_bindings)) as executor:
+        while pending_trials or in_flight:
+            while pending_trials and available_bindings:
+                trial = pending_trials.pop(0)
+                binding = available_bindings.pop(0)
+                device_label = "default" if binding is None else f"gpu={binding}"
+                trial_id = f"trial_{trial['trial_index']:03d}"
+                print(
+                    f"[run] {trial_id} | activation={trial['narx_activation']} | layers={trial['narx_num_hidden_layers']} "
+                    f"| nodes={trial['narx_hidden_dim']} | pred_len={trial['narx_prediction_length_sec']} s "
+                    f"| opt={trial['optimizer_name']} | {device_label}"
+                )
+                future = executor.submit(
+                    run_trial,
+                    repo_root,
+                    main_arg_tokens,
+                    shared_bundle_path,
+                    trial_root,
+                    trial,
+                    sweep_args.sweep_objective,
+                    binding,
+                )
+                in_flight[future] = binding
+
+            if not in_flight:
+                continue
+
+            completed_futures, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            for future in completed_futures:
+                binding = in_flight.pop(future)
+                available_bindings.append(binding)
+                row = future.result()
+                all_rows.append(row)
+                ordered_rows = sort_rows(all_rows, sweep_args.sweep_objective)
+                save_json(ordered_rows, str(results_json_path))
+                save_results_csv(ordered_rows, results_csv_path)
 
     ordered_rows = sort_rows(all_rows, sweep_args.sweep_objective)
     save_json(ordered_rows, str(results_json_path))
