@@ -139,6 +139,22 @@ def main() -> None:
             config.narx_num_hidden_layers,
             config.narx_use_velocity_input,
         )
+        if not np.isclose(config.dt_train_sec, config.dt_full_sec):
+            logger.warning(
+                "NARX is trained with dt_train=%.6f s but rolled out with dt_full=%.6f s. "
+                "For one-step NARX this step mismatch often causes near-constant predictions. "
+                "Prefer using the same sampling interval for training and forecast.",
+                config.dt_train_sec,
+                config.dt_full_sec,
+            )
+        if config.narx_input_lags <= 2 or config.narx_feedback_lags <= 2:
+            logger.warning(
+                "Current NARX delays are very short (input_lags=%d, feedback_lags=%d). "
+                "With only ~400 s observations this often collapses to mean/persistence behavior. "
+                "Try 32-128 delays first.",
+                config.narx_input_lags,
+                config.narx_feedback_lags,
+            )
     else:
         logger.info("Prediction model: %s", config.model_name)
 
