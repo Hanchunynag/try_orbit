@@ -1,4 +1,4 @@
-﻿"""Loss functions for multi-step residual forecasting."""
+"""Loss functions for multi-step residual forecasting."""
 
 from __future__ import annotations
 
@@ -37,3 +37,16 @@ def composite_sequence_loss(
         "smooth": float(loss_smooth.detach().cpu()),
     }
     return total_loss, parts
+
+
+def step_mse_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute one-step MSE for the NARX predictor."""
+    loss = F.mse_loss(y_pred, y_true)
+    zero = 0.0
+    parts = {
+        "loss": float(loss.detach().cpu()),
+        "pred": float(loss.detach().cpu()),
+        "diff": zero,
+        "smooth": zero,
+    }
+    return loss, parts

@@ -1,4 +1,4 @@
-﻿"""Preprocessing utilities for residual learning."""
+"""Preprocessing utilities for residual learning."""
 
 from __future__ import annotations
 
@@ -74,6 +74,17 @@ def build_static_features(
             np.cos(phase),
         ]
     )
+
+
+def build_narx_exogenous_features(
+    r_sgp4_eci_m: np.ndarray,
+    v_sgp4_eci_mps: np.ndarray,
+    include_velocity: bool,
+) -> np.ndarray:
+    """Build paper-style exogenous inputs from the nominal SGP4 trajectory."""
+    if include_velocity:
+        return np.concatenate([r_sgp4_eci_m, v_sgp4_eci_mps], axis=1)
+    return np.asarray(r_sgp4_eci_m, dtype=np.float64)
 
 
 def combine_target(pos_rtn: np.ndarray, vel_rtn: Optional[np.ndarray], predict_velocity: bool) -> np.ndarray:
@@ -191,3 +202,13 @@ def fit_scalers(
     future_scaler = StandardScaler().fit(future_covariates_train)
     target_scaler = StandardScaler().fit(target_train)
     return {"history": history_scaler, "future": future_scaler, "target": target_scaler}
+
+
+def fit_narx_scalers(
+    exogenous_inputs_train: np.ndarray,
+    target_train: np.ndarray,
+) -> dict[str, StandardScaler]:
+    """Fit the paper-style NARX scalers using training-segment statistics only."""
+    exogenous_scaler = StandardScaler().fit(exogenous_inputs_train)
+    target_scaler = StandardScaler().fit(target_train)
+    return {"narx_input": exogenous_scaler, "target": target_scaler}

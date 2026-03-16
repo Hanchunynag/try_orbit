@@ -1,4 +1,4 @@
-﻿"""Model construction, training, and rollout utilities."""
+"""Model construction, training, and rollout utilities."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from models.lstm_model import LSTMEncoderDecoder
+from models.narx_model import NARXForecaster
 from models.tcn_model import TCNForecaster
-from train.losses import composite_sequence_loss
+from train.losses import composite_sequence_loss, step_mse_loss
 
 
 @dataclass
@@ -27,6 +28,18 @@ class TrainResult:
 
 def build_model(config, history_dim: int, future_dim: int, output_dim: int) -> torch.nn.Module:
     """Instantiate the selected PyTorch model."""
+    if config.model_name == "narx":
+        return NARXForecaster(
+            exogenous_dim=history_dim,
+            feedback_dim=future_dim,
+            output_dim=output_dim,
+            input_lags=config.narx_input_lags,
+            feedback_lags=config.narx_feedback_lags,
+            hidden_dim=config.narx_hidden_dim,
+            num_hidden_layers=config.narx_num_hidden_layers,
+            activation=config.narx_activation,
+            dropout=config.narx_dropout,
+        )
     if config.model_name == "tcn":
         return TCNForecaster(
             history_dim=history_dim,
@@ -89,13 +102,16 @@ def run_epoch(model, loader, optimizer, device, config, train_mode: bool) -> dic
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
             y_pred = model(x_hist, x_future)
-            loss, parts = composite_sequence_loss(
-                y_pred=y_pred,
-                y_true=y,
-                lambda_pred=config.lambda_pred,
-                lambda_diff=config.lambda_diff,
-                lambda_smooth=config.lambda_smooth,
-            )
+            if y_pred.ndim == 2:
+                loss, parts = step_mse_loss(y_pred=y_pred, y_true=y)
+            else:
+                loss, parts = composite_sequence_loss(
+                    y_pred=y_pred,
+                    y_true=y,
+                    lambda_pred=config.lambda_pred,
+                    lambda_diff=config.lambda_diff,
+                    lambda_smooth=config.lambda_smooth,
+                )
             if train_mode:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -113,11 +129,12 @@ def train_model(dataset, config, models_dir: str, logger) -> TrainResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_loader, val_loader = build_dataloaders(dataset, config)
     sample_hist, sample_future, sample_target = dataset[0]
+    output_dim = int(sample_target.shape[-1]) if sample_target.ndim > 0 else 1
     model = build_model(
         config=config,
         history_dim=sample_hist.shape[-1],
         future_dim=sample_future.shape[-1],
-        output_dim=sample_target.shape[-1],
+        output_dim=output_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -215,4 +232,69 @@ def autoregressive_rollout(
             predicted[cursor:future_end] = pred_block[: future_end - cursor]
             cursor = future_end
             logger.info("Forecast rollout progress: %d / %d", cursor, total_len)
+    return predicted
+
+
+def narx_teacher_forced_rollout(
+    model: torch.nn.Module,
+    device: str,
+    exogenous_inputs: np.ndarray,
+    feedback_series: np.ndarray,
+    config,
+    scalers: dict,
+) -> np.ndarray:
+    """Predict the training segment with open-loop NARX feedback from observed history."""
+    max_lag = max(config.narx_input_lags, config.narx_feedback_lags)
+    predicted = np.zeros_like(feedback_series)
+    predicted[:max_lag] = feedback_series[:max_lag]
+    model.eval()
+
+    with torch.no_grad():
+        for step in range(max_lag, len(feedback_series)):
+            exog_window = exogenous_inputs[step - config.narx_input_lags : step]
+            feedback_window = feedback_series[step - config.narx_feedback_lags : step]
+            x_exog = scalers["narx_input"].transform(exog_window)[None, ...].astype(np.float32)
+            x_feedback = scalers["target"].transform(feedback_window)[None, ...].astype(np.float32)
+            pred_norm = model(
+                torch.from_numpy(x_exog).to(device),
+                torch.from_numpy(x_feedback).to(device),
+            ).cpu().numpy()
+            predicted[step] = scalers["target"].inverse_transform(pred_norm)[0]
+    return predicted
+
+
+def narx_autoregressive_rollout(
+    model: torch.nn.Module,
+    device: str,
+    exogenous_inputs_full: np.ndarray,
+    feedback_seed_full: np.ndarray,
+    forecast_start_index: int,
+    config,
+    scalers: dict,
+    logger,
+) -> np.ndarray:
+    """Roll the NARX model forward in closed loop after the observation window ends."""
+    max_lag = max(config.narx_input_lags, config.narx_feedback_lags)
+    if forecast_start_index <= max_lag:
+        raise ValueError("Not enough observed history before forecast start for the chosen NARX delays.")
+
+    model.eval()
+    predicted = feedback_seed_full.copy()
+    total_len = len(predicted)
+    progress_interval = max((total_len - forecast_start_index) // 20, 1)
+
+    with torch.no_grad():
+        for step in range(forecast_start_index, total_len):
+            exog_window = exogenous_inputs_full[step - config.narx_input_lags : step]
+            feedback_window = predicted[step - config.narx_feedback_lags : step]
+            x_exog = scalers["narx_input"].transform(exog_window)[None, ...].astype(np.float32)
+            x_feedback = scalers["target"].transform(feedback_window)[None, ...].astype(np.float32)
+            pred_norm = model(
+                torch.from_numpy(x_exog).to(device),
+                torch.from_numpy(x_feedback).to(device),
+            ).cpu().numpy()
+            predicted[step] = scalers["target"].inverse_transform(pred_norm)[0]
+            completed = step - forecast_start_index + 1
+            if completed % progress_interval == 0 or step == total_len - 1:
+                logger.info("NARX closed-loop rollout progress: %d / %d", step + 1, total_len)
     return predicted

@@ -33,10 +33,10 @@ class ExperimentConfig:
     noise_sigma_vr_mps: float = 0.01
     noise_sigma_vt_mps: float = 0.01
     noise_sigma_vn_mps: float = 0.01
-    model_name: str = "tcn"
+    model_name: str = "narx"
     input_len: int = 500
     pred_len: int = 100
-    window_stride: int = 10
+    window_stride: int = 1
     batch_size: int = 64
     epochs: int = 40
     learning_rate: float = 1e-3
@@ -52,6 +52,13 @@ class ExperimentConfig:
     num_layers: int = 3
     dropout: float = 0.1
     tcn_kernel_size: int = 3
+    narx_input_lags: int = 1
+    narx_feedback_lags: int = 1
+    narx_hidden_dim: int = 10
+    narx_num_hidden_layers: int = 1
+    narx_activation: str = "tanh"
+    narx_dropout: float = 0.0
+    narx_use_velocity_input: bool = False
     orekit_mass_kg: float = 10.0
     orekit_drag_cd: float = 2.2
     orekit_drag_area_m2: float = 0.1
@@ -103,17 +110,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dt_train", type=float, default=0.01, help="Dense sampling interval for training segment in seconds.")
     parser.add_argument("--dt_full", type=float, default=0.1, help="Sampling interval for forecast segment in seconds.")
     parser.add_argument("--observation_mode", choices=["residual", "state"], default="residual")
-    parser.add_argument("--predict_velocity", action="store_true", help="Learn both position and velocity RTN residuals.")
+    parser.add_argument(
+        "--predict_velocity",
+        action="store_true",
+        help="Learn both position and velocity RTN residuals. Leave disabled to learn only RTN position residuals [R, T, N], which is recommended for short observation arcs.",
+    )
     parser.add_argument("--noise_sigma_r", type=float, default=1.0, help="Noise sigma in R direction, meters.")
     parser.add_argument("--noise_sigma_t", type=float, default=1.0, help="Noise sigma in T direction, meters.")
     parser.add_argument("--noise_sigma_n", type=float, default=1.0, help="Noise sigma in N direction, meters.")
     parser.add_argument("--noise_sigma_vr", type=float, default=0.01, help="Velocity noise sigma in R, m/s.")
     parser.add_argument("--noise_sigma_vt", type=float, default=0.01, help="Velocity noise sigma in T, m/s.")
     parser.add_argument("--noise_sigma_vn", type=float, default=0.01, help="Velocity noise sigma in N, m/s.")
-    parser.add_argument("--model_name", choices=["tcn", "lstm"], default="tcn")
+    parser.add_argument("--model_name", choices=["narx", "tcn", "lstm"], default="narx")
     parser.add_argument("--input_len", type=int, default=500, help="History window length.")
     parser.add_argument("--pred_len", type=int, default=100, help="Prediction horizon per rollout block.")
-    parser.add_argument("--window_stride", type=int, default=10, help="Sliding-window stride.")
+    parser.add_argument("--window_stride", type=int, default=1, help="Sliding-window stride.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
@@ -129,6 +140,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--tcn_kernel_size", type=int, default=3)
+    parser.add_argument(
+        "--narx_input_lags",
+        type=int,
+        default=1,
+        help="Number of delayed exogenous SGP4 input samples used by the NARX predictor.",
+    )
+    parser.add_argument(
+        "--narx_feedback_lags",
+        type=int,
+        default=1,
+        help="Number of delayed residual observations/predictions fed back into the NARX predictor.",
+    )
+    parser.add_argument(
+        "--narx_hidden_dim",
+        type=int,
+        default=10,
+        help="Hidden layer width of the paper-style NARX predictor.",
+    )
+    parser.add_argument(
+        "--narx_num_hidden_layers",
+        type=int,
+        default=1,
+        help="Number of hidden layers in the paper-style NARX predictor.",
+    )
+    parser.add_argument(
+        "--narx_activation",
+        choices=["relu", "tanh"],
+        default="tanh",
+        help="Hidden activation of the paper-style NARX predictor.",
+    )
+    parser.add_argument(
+        "--narx_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout inside the paper-style NARX predictor.",
+    )
+    parser.add_argument(
+        "--narx_use_velocity_input",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Augment NARX exogenous inputs with nominal SGP4 velocity states. Default keeps the paper's position-focused setup.",
+    )
     parser.add_argument("--orekit_mass_kg", type=float, default=10.0)
     parser.add_argument("--orekit_drag_cd", type=float, default=2.2)
     parser.add_argument("--orekit_drag_area_m2", type=float, default=0.1)
@@ -195,6 +248,13 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         num_layers=args.num_layers,
         dropout=args.dropout,
         tcn_kernel_size=args.tcn_kernel_size,
+        narx_input_lags=args.narx_input_lags,
+        narx_feedback_lags=args.narx_feedback_lags,
+        narx_hidden_dim=args.narx_hidden_dim,
+        narx_num_hidden_layers=args.narx_num_hidden_layers,
+        narx_activation=args.narx_activation,
+        narx_dropout=args.narx_dropout,
+        narx_use_velocity_input=args.narx_use_velocity_input,
         orekit_mass_kg=args.orekit_mass_kg,
         orekit_drag_cd=args.orekit_drag_cd,
         orekit_drag_area_m2=args.orekit_drag_area_m2,

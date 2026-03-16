@@ -9,13 +9,15 @@ from typing import Optional
 import numpy as np
 
 from config import build_arg_parser, config_from_args
-from data.dataset import SequenceWindowDataset
+from data.dataset import NARXWindowDataset, SequenceWindowDataset
 from data.preprocess import (
     build_history_features,
+    build_narx_exogenous_features,
     build_static_features,
     build_time_grid,
     combine_target,
     fit_scalers,
+    fit_narx_scalers,
     make_noisy_training_observations,
     split_target,
     estimate_orbital_period_sec,
@@ -43,7 +45,12 @@ from orbit.hpop_prop import propagate_orekit_truth
 from orbit.rtn import build_eci_to_rtn_matrices, project_batch_eci_to_rtn, project_batch_rtn_to_eci
 from orbit.sgp4_prop import get_tle_epoch_state_gcrf, propagate_sgp4_gcrf
 from orbit.tle_io import load_tle_satellite
-from train.trainer import autoregressive_rollout, train_model
+from train.trainer import (
+    autoregressive_rollout,
+    narx_autoregressive_rollout,
+    narx_teacher_forced_rollout,
+    train_model,
+)
 from utils.io_utils import (
     ensure_output_dirs,
     save_json,
@@ -69,7 +76,14 @@ def parse_utc_datetime(value: Optional[str]) -> Optional[datetime]:
     return dt
 
 
-def teacher_forced_train_rollout(model, device: str, static_train: np.ndarray, noisy_target_train: np.ndarray, config, scalers) -> np.ndarray:
+def seq2seq_teacher_forced_train_rollout(
+    model,
+    device: str,
+    static_train: np.ndarray,
+    noisy_target_train: np.ndarray,
+    config,
+    scalers,
+) -> np.ndarray:
     """Predict the training segment using teacher-forced history only."""
     predicted = np.zeros_like(noisy_target_train)
     predicted[: config.input_len] = noisy_target_train[: config.input_len]
@@ -116,6 +130,17 @@ def main() -> None:
         config.receiver_lon_deg,
         config.receiver_alt_m,
     )
+    if config.model_name == "narx":
+        logger.info(
+            "Prediction model: paper-style NARX | input_lags=%d | feedback_lags=%d | hidden_dim=%d | hidden_layers=%d | velocity_input=%s",
+            config.narx_input_lags,
+            config.narx_feedback_lags,
+            config.narx_hidden_dim,
+            config.narx_num_hidden_layers,
+            config.narx_use_velocity_input,
+        )
+    else:
+        logger.info("Prediction model: %s", config.model_name)
 
     satellite = load_tle_satellite(config.tle_file, config.sat_name)
     scenario_start_utc = parse_utc_datetime(config.scenario_start_utc) or satellite.epoch_utc
@@ -142,7 +167,15 @@ def main() -> None:
     train_mask = scenario_times_sec < config.train_duration_sec
     forecast_mask = scenario_times_sec >= config.train_duration_sec
     num_train = int(np.sum(train_mask))
-    if num_train <= config.input_len + config.pred_len:
+    if config.model_name == "narx":
+        required_train = max(config.narx_input_lags, config.narx_feedback_lags) + 1
+        if num_train < required_train:
+            raise ValueError(
+                "Training sequence is too short for the chosen NARX delays. "
+                f"num_train={num_train}, narx_input_lags={config.narx_input_lags}, "
+                f"narx_feedback_lags={config.narx_feedback_lags}."
+            )
+    elif num_train <= config.input_len + config.pred_len:
         raise ValueError(
             "Training sequence is too short for the chosen input_len and pred_len. "
             f"num_train={num_train}, input_len={config.input_len}, pred_len={config.pred_len}."
@@ -176,6 +209,10 @@ def main() -> None:
     clean_delta_r_rtn_m = project_batch_eci_to_rtn(c_eci_to_rtn, clean_delta_r_eci_m)
     clean_delta_v_rtn_mps = project_batch_eci_to_rtn(c_eci_to_rtn, clean_delta_v_eci_mps)
     clean_target_full = combine_target(clean_delta_r_rtn_m, clean_delta_v_rtn_mps, config.predict_velocity)
+    if config.predict_velocity:
+        logger.info("Learning target: RTN residuals [R, T, N, Vr, Vt, Vn].")
+    else:
+        logger.info("Learning target: RTN position residuals [R, T, N].")
 
     log_section(logger, "Synthetic Observations")
     observation_bundle = make_noisy_training_observations(
@@ -191,55 +228,99 @@ def main() -> None:
         clean_vel_rtn=clean_delta_v_rtn_mps,
     )
 
-    orbital_period_sec = estimate_orbital_period_sec(r_sgp4_eci_m[0], v_sgp4_eci_mps[0])
-    static_features_full = build_static_features(
-        times_sec=scenario_times_sec,
-        r_sgp4_eci_m=r_sgp4_eci_m,
-        v_sgp4_eci_mps=v_sgp4_eci_mps,
-        orbital_period_sec=orbital_period_sec,
-    )
-    static_features_train = static_features_full[train_mask]
-    history_features_train = build_history_features(static_features_train, observation_bundle.noisy_target)
-    scalers = fit_scalers(
-        history_features_train=history_features_train,
-        future_covariates_train=static_features_train,
-        target_train=observation_bundle.clean_target,
-    )
-    scalers["input_len"] = config.input_len
+    if config.model_name == "narx":
+        model_inputs_full = build_narx_exogenous_features(
+            r_sgp4_eci_m=r_sgp4_eci_m,
+            v_sgp4_eci_mps=v_sgp4_eci_mps,
+            include_velocity=config.narx_use_velocity_input,
+        )
+        model_inputs_train = model_inputs_full[train_mask]
+        scalers = fit_narx_scalers(
+            exogenous_inputs_train=model_inputs_train,
+            target_train=observation_bundle.clean_target,
+        )
+        dataset = NARXWindowDataset(
+            exogenous_inputs=scalers["narx_input"].transform(model_inputs_train),
+            feedback_series=scalers["target"].transform(observation_bundle.noisy_target),
+            targets=scalers["target"].transform(observation_bundle.clean_target),
+            input_lags=config.narx_input_lags,
+            feedback_lags=config.narx_feedback_lags,
+            stride=config.window_stride,
+        )
+        train_eval_start = max(config.narx_input_lags, config.narx_feedback_lags)
+    else:
+        orbital_period_sec = estimate_orbital_period_sec(r_sgp4_eci_m[0], v_sgp4_eci_mps[0])
+        static_features_full = build_static_features(
+            times_sec=scenario_times_sec,
+            r_sgp4_eci_m=r_sgp4_eci_m,
+            v_sgp4_eci_mps=v_sgp4_eci_mps,
+            orbital_period_sec=orbital_period_sec,
+        )
+        static_features_train = static_features_full[train_mask]
+        history_features_train = build_history_features(static_features_train, observation_bundle.noisy_target)
+        scalers = fit_scalers(
+            history_features_train=history_features_train,
+            future_covariates_train=static_features_train,
+            target_train=observation_bundle.clean_target,
+        )
+        scalers["input_len"] = config.input_len
 
-    dataset = SequenceWindowDataset(
-        history_features=scalers["history"].transform(history_features_train),
-        future_covariates=scalers["future"].transform(static_features_train),
-        targets=scalers["target"].transform(observation_bundle.clean_target),
-        input_len=config.input_len,
-        pred_len=config.pred_len,
-        stride=config.window_stride,
-    )
+        dataset = SequenceWindowDataset(
+            history_features=scalers["history"].transform(history_features_train),
+            future_covariates=scalers["future"].transform(static_features_train),
+            targets=scalers["target"].transform(observation_bundle.clean_target),
+            input_len=config.input_len,
+            pred_len=config.pred_len,
+            stride=config.window_stride,
+        )
+        train_eval_start = config.input_len
 
     log_section(logger, "Training")
     train_result = train_model(dataset=dataset, config=config, models_dir=output_dirs["models"], logger=logger)
-    train_pred_target = teacher_forced_train_rollout(
-        model=train_result.model,
-        device=train_result.device,
-        static_train=static_features_train,
-        noisy_target_train=observation_bundle.noisy_target,
-        config=config,
-        scalers=scalers,
-    )
+    if config.model_name == "narx":
+        train_pred_target = narx_teacher_forced_rollout(
+            model=train_result.model,
+            device=train_result.device,
+            exogenous_inputs=model_inputs_train,
+            feedback_series=observation_bundle.noisy_target,
+            config=config,
+            scalers=scalers,
+        )
+    else:
+        train_pred_target = seq2seq_teacher_forced_train_rollout(
+            model=train_result.model,
+            device=train_result.device,
+            static_train=static_features_train,
+            noisy_target_train=observation_bundle.noisy_target,
+            config=config,
+            scalers=scalers,
+        )
 
     full_seed_target = np.zeros_like(clean_target_full)
     full_seed_target[train_mask] = observation_bundle.noisy_target
     log_section(logger, "Forecast Rollout")
-    predicted_target_full = autoregressive_rollout(
-        model=train_result.model,
-        device=train_result.device,
-        static_features_full=static_features_full,
-        residual_history_full=full_seed_target,
-        forecast_start_index=num_train,
-        pred_len=config.pred_len,
-        scalers=scalers,
-        logger=logger,
-    )
+    if config.model_name == "narx":
+        predicted_target_full = narx_autoregressive_rollout(
+            model=train_result.model,
+            device=train_result.device,
+            exogenous_inputs_full=model_inputs_full,
+            feedback_seed_full=full_seed_target,
+            forecast_start_index=num_train,
+            config=config,
+            scalers=scalers,
+            logger=logger,
+        )
+    else:
+        predicted_target_full = autoregressive_rollout(
+            model=train_result.model,
+            device=train_result.device,
+            static_features_full=static_features_full,
+            residual_history_full=full_seed_target,
+            forecast_start_index=num_train,
+            pred_len=config.pred_len,
+            scalers=scalers,
+            logger=logger,
+        )
 
     pred_pos_rtn_full, pred_vel_rtn_full = split_target(predicted_target_full, config.predict_velocity)
     corrected_r_eci_m = r_sgp4_eci_m + project_batch_rtn_to_eci(c_eci_to_rtn, pred_pos_rtn_full)
@@ -253,8 +334,8 @@ def main() -> None:
     baseline_error_norm_m = np.linalg.norm(r_sgp4_eci_m - r_truth_eci_m, axis=1)
     corrected_error_norm_m = np.linalg.norm(corrected_r_eci_m - r_truth_eci_m, axis=1)
 
-    train_truth_eval = observation_bundle.clean_target[config.input_len :]
-    train_pred_eval = train_pred_target[config.input_len :]
+    train_truth_eval = observation_bundle.clean_target[train_eval_start:]
+    train_pred_eval = train_pred_target[train_eval_start:]
     train_truth_pos, train_truth_vel = split_target(train_truth_eval, config.predict_velocity)
     train_pred_pos, train_pred_vel = split_target(train_pred_eval, config.predict_velocity)
 
@@ -273,6 +354,12 @@ def main() -> None:
             "tle_epoch_utc": satellite.epoch_utc.isoformat(),
             "scenario_start_utc": scenario_start_utc.isoformat(),
             "common_inertial_frame": "GCRF",
+            "learning_target_frame": "RTN",
+            "learning_target_components": (
+                ["R", "T", "N", "Vr", "Vt", "Vn"]
+                if config.predict_velocity
+                else ["R", "T", "N"]
+            ),
             "orekit_data_path": orekit_context["data_path"],
             "synthetic_truth_note": "Orekit numerical truth is initialized from the TLE-epoch SGP4 Cartesian state and is not a real observed truth orbit.",
             "truth_force_models": {
@@ -285,7 +372,7 @@ def main() -> None:
             },
         },
         "train_segment": {
-            "prediction_start_sec": float(scenario_times_sec[config.input_len]),
+            "prediction_start_sec": float(scenario_times_sec[train_eval_start]),
             "position_rtn": component_metrics(train_truth_pos, train_pred_pos, COMPONENT_LABELS_POS),
         },
         "forecast_segment": {
@@ -325,14 +412,18 @@ def main() -> None:
 
     log_section(logger, "Saving Outputs")
     save_json(config.to_dict(), os.path.join(output_dirs["root"], "used_config.json"))
-    save_json(
-        {
+    if config.model_name == "narx":
+        scaler_payload = {
+            "narx_input": scalers["narx_input"].to_dict(),
+            "target": scalers["target"].to_dict(),
+        }
+    else:
+        scaler_payload = {
             "history": scalers["history"].to_dict(),
             "future": scalers["future"].to_dict(),
             "target": scalers["target"].to_dict(),
-        },
-        os.path.join(output_dirs["data"], "scaler.json"),
-    )
+        }
+    save_json(scaler_payload, os.path.join(output_dirs["data"], "scaler.json"))
     save_npz(
         os.path.join(output_dirs["data"], "sgp4_states.npz"),
         t_sec=scenario_times_sec,
