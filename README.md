@@ -122,6 +122,43 @@ python main.py \
   --seed 42
 ```
 
+## Paper-Style NARX Sweep
+
+Use `sweep_narx.py` to run a random search over the paper-style NARX hyperparameters:
+
+- activation function
+- number of hidden layers
+- nodes per layer
+- prediction length in seconds
+- optimizer
+
+The sweep script forwards the remaining arguments to `main.py`, creates one output directory per trial, and writes:
+
+- `manifest.json`
+- `results.json`
+- `results.csv`
+- `best_trial.json`
+
+Example:
+
+```bash
+python sweep_narx.py \
+  --sweep_num_trials 24 \
+  --sweep_output_dir outputs/sweeps/narx_table1 \
+  --tle_file data/sample.tle \
+  --sat_name "ISS (ZARYA)" \
+  --orekit_data_path D:\path\to\orekit-data \
+  --train_duration 400 \
+  --total_duration 3600 \
+  --dt_train 0.1 \
+  --dt_full 0.1 \
+  --observation_mode residual \
+  --noise_sigma_r 0.0 \
+  --noise_sigma_t 0.0 \
+  --noise_sigma_n 0.0 \
+  --seed 42
+```
+
 ## Your Scenario Example
 
 ```bash

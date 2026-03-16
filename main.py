@@ -19,6 +19,7 @@ from data.preprocess import (
     fit_scalers,
     fit_narx_scalers,
     make_noisy_training_observations,
+    prediction_steps_from_seconds,
     split_target,
     estimate_orbital_period_sec,
 )
@@ -139,10 +140,17 @@ def main() -> None:
             config.narx_num_hidden_layers,
             config.narx_use_velocity_input,
         )
+        logger.info(
+            "NARX hyperparameters: activation=%s | prediction_length=%.6f s | optimizer=%s | lr_scheduler=%s",
+            config.narx_activation,
+            config.narx_prediction_length_sec,
+            config.optimizer_name,
+            config.lr_scheduler_name,
+        )
         if not np.isclose(config.dt_train_sec, config.dt_full_sec):
             logger.warning(
                 "NARX is trained with dt_train=%.6f s but rolled out with dt_full=%.6f s. "
-                "For one-step NARX this step mismatch often causes near-constant predictions. "
+                "For tapped-delay NARX this step mismatch often causes near-constant predictions. "
                 "Prefer using the same sampling interval for training and forecast.",
                 config.dt_train_sec,
                 config.dt_full_sec,
@@ -184,12 +192,14 @@ def main() -> None:
     forecast_mask = scenario_times_sec >= config.train_duration_sec
     num_train = int(np.sum(train_mask))
     if config.model_name == "narx":
-        required_train = max(config.narx_input_lags, config.narx_feedback_lags) + 1
+        narx_prediction_steps_train = prediction_steps_from_seconds(config.narx_prediction_length_sec, config.dt_train_sec)
+        narx_prediction_steps_full = prediction_steps_from_seconds(config.narx_prediction_length_sec, config.dt_full_sec)
+        required_train = max(config.narx_input_lags, config.narx_feedback_lags) + narx_prediction_steps_train
         if num_train < required_train:
             raise ValueError(
                 "Training sequence is too short for the chosen NARX delays. "
                 f"num_train={num_train}, narx_input_lags={config.narx_input_lags}, "
-                f"narx_feedback_lags={config.narx_feedback_lags}."
+                f"narx_feedback_lags={config.narx_feedback_lags}, prediction_steps={narx_prediction_steps_train}."
             )
     elif num_train <= config.input_len + config.pred_len:
         raise ValueError(
@@ -261,9 +271,10 @@ def main() -> None:
             targets=scalers["target"].transform(observation_bundle.clean_target),
             input_lags=config.narx_input_lags,
             feedback_lags=config.narx_feedback_lags,
+            prediction_steps=narx_prediction_steps_train,
             stride=config.window_stride,
         )
-        train_eval_start = max(config.narx_input_lags, config.narx_feedback_lags)
+        train_eval_start = max(config.narx_input_lags, config.narx_feedback_lags) + narx_prediction_steps_train - 1
     else:
         orbital_period_sec = estimate_orbital_period_sec(r_sgp4_eci_m[0], v_sgp4_eci_mps[0])
         static_features_full = build_static_features(
@@ -299,6 +310,7 @@ def main() -> None:
             device=train_result.device,
             exogenous_inputs=model_inputs_train,
             feedback_series=observation_bundle.noisy_target,
+            prediction_steps=narx_prediction_steps_train,
             config=config,
             scalers=scalers,
         )
@@ -322,6 +334,7 @@ def main() -> None:
             exogenous_inputs_full=model_inputs_full,
             feedback_seed_full=full_seed_target,
             forecast_start_index=num_train,
+            prediction_steps=narx_prediction_steps_full,
             config=config,
             scalers=scalers,
             logger=logger,
@@ -376,6 +389,9 @@ def main() -> None:
                 if config.predict_velocity
                 else ["R", "T", "N"]
             ),
+            "optimizer_name": config.optimizer_name,
+            "lr_scheduler_name": config.lr_scheduler_name,
+            "narx_prediction_length_sec": config.narx_prediction_length_sec if config.model_name == "narx" else None,
             "orekit_data_path": orekit_context["data_path"],
             "synthetic_truth_note": "Orekit numerical truth is initialized from the TLE-epoch SGP4 Cartesian state and is not a real observed truth orbit.",
             "truth_force_models": {

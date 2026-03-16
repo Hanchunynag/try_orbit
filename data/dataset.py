@@ -45,7 +45,7 @@ class SequenceWindowDataset(Dataset):
 
 
 class NARXWindowDataset(Dataset):
-    """Create tapped-delay windows for one-step NARX training."""
+    """Create tapped-delay windows for configurable-horizon NARX training."""
 
     def __init__(
         self,
@@ -54,12 +54,15 @@ class NARXWindowDataset(Dataset):
         targets: np.ndarray,
         input_lags: int,
         feedback_lags: int,
+        prediction_steps: int = 1,
         stride: int = 1,
     ) -> None:
         if len(exogenous_inputs) != len(feedback_series) or len(exogenous_inputs) != len(targets):
             raise ValueError("All NARX input sequences must have the same length.")
         if input_lags <= 0 or feedback_lags <= 0:
             raise ValueError("NARX delays must be positive.")
+        if prediction_steps <= 0:
+            raise ValueError("Prediction steps must be positive.")
         if stride <= 0:
             raise ValueError("Stride must be positive.")
 
@@ -68,10 +71,12 @@ class NARXWindowDataset(Dataset):
         self.targets = targets.astype(np.float32)
         self.input_lags = input_lags
         self.feedback_lags = feedback_lags
+        self.prediction_steps = prediction_steps
         self.max_lag = max(input_lags, feedback_lags)
-        if len(self.targets) <= self.max_lag:
-            raise ValueError("Sequence is too short for the chosen NARX delays.")
-        self.starts = np.arange(self.max_lag, len(self.targets), stride, dtype=np.int64)
+        max_start = len(self.targets) - self.prediction_steps + 1
+        if max_start <= self.max_lag:
+            raise ValueError("Sequence is too short for the chosen NARX delays and prediction steps.")
+        self.starts = np.arange(self.max_lag, max_start, stride, dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.starts)
@@ -80,7 +85,8 @@ class NARXWindowDataset(Dataset):
         step = int(self.starts[index])
         exog_slice = slice(step - self.input_lags, step)
         feedback_slice = slice(step - self.feedback_lags, step)
+        target_index = step + self.prediction_steps - 1
         x_exog = torch.from_numpy(self.exogenous_inputs[exog_slice])
         x_feedback = torch.from_numpy(self.feedback_series[feedback_slice])
-        y = torch.from_numpy(self.targets[step])
+        y = torch.from_numpy(self.targets[target_index])
         return x_exog, x_feedback, y

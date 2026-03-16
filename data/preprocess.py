@@ -87,6 +87,23 @@ def build_narx_exogenous_features(
     return np.asarray(r_sgp4_eci_m, dtype=np.float64)
 
 
+def prediction_steps_from_seconds(prediction_length_sec: float, sample_dt_sec: float) -> int:
+    """Convert a prediction horizon in seconds into an integer number of samples."""
+    if prediction_length_sec <= 0:
+        raise ValueError("prediction_length_sec must be positive.")
+    if sample_dt_sec <= 0:
+        raise ValueError("sample_dt_sec must be positive.")
+    steps_float = prediction_length_sec / sample_dt_sec
+    steps = int(round(steps_float))
+    if steps <= 0:
+        raise ValueError("Prediction length must correspond to at least one sample.")
+    if not np.isclose(steps_float, steps, atol=1e-9, rtol=1e-9):
+        raise ValueError(
+            f"Prediction length {prediction_length_sec} s is not an integer multiple of the sampling interval {sample_dt_sec} s."
+        )
+    return steps
+
+
 def combine_target(pos_rtn: np.ndarray, vel_rtn: Optional[np.ndarray], predict_velocity: bool) -> np.ndarray:
     """Stack position and optional velocity residuals into the final target tensor."""
     if predict_velocity:

@@ -58,7 +58,15 @@ class ExperimentConfig:
     narx_num_hidden_layers: int = 1
     narx_activation: str = "tanh"
     narx_dropout: float = 0.0
+    narx_snake_alpha: float = 1.0
+    narx_prediction_length_sec: float = 0.1
     narx_use_velocity_input: bool = False
+    optimizer_name: str = "adam"
+    optimizer_momentum: float = 0.9
+    lr_scheduler_name: str = "plateau"
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 5
+    lr_scheduler_min_lr: float = 1e-6
     orekit_mass_kg: float = 10.0
     orekit_drag_cd: float = 2.2
     orekit_drag_area_m2: float = 0.1
@@ -166,7 +174,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--narx_activation",
-        choices=["relu", "tanh"],
+        choices=["linear", "relu", "tanh", "sigmoid", "snake"],
         default="tanh",
         help="Hidden activation of the paper-style NARX predictor.",
     )
@@ -177,11 +185,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Dropout inside the paper-style NARX predictor.",
     )
     parser.add_argument(
+        "--narx_snake_alpha",
+        type=float,
+        default=1.0,
+        help="Snake activation alpha parameter used when narx_activation=snake.",
+    )
+    parser.add_argument(
+        "--narx_prediction_length",
+        type=float,
+        default=0.1,
+        help="Prediction horizon in seconds for the NARX target, matching the paper's prediction-length hyperparameter.",
+    )
+    parser.add_argument(
         "--narx_use_velocity_input",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Augment NARX exogenous inputs with nominal SGP4 velocity states. Default keeps the paper's position-focused setup.",
     )
+    parser.add_argument(
+        "--optimizer_name",
+        choices=["adam", "adagrad", "sgd", "yogi", "adamw"],
+        default="adam",
+        help="Optimizer used for model training. The first four options align with the paper's Table 1 search space.",
+    )
+    parser.add_argument("--optimizer_momentum", type=float, default=0.9, help="Momentum used by SGD.")
+    parser.add_argument(
+        "--lr_scheduler_name",
+        choices=["none", "plateau"],
+        default="plateau",
+        help="Learning-rate scheduler. Plateau reduction is closer to the paper's incremental LR decay.",
+    )
+    parser.add_argument("--lr_scheduler_factor", type=float, default=0.5, help="LR decay factor for the plateau scheduler.")
+    parser.add_argument("--lr_scheduler_patience", type=int, default=5, help="Patience for the plateau scheduler.")
+    parser.add_argument("--lr_scheduler_min_lr", type=float, default=1e-6, help="Minimum LR for the plateau scheduler.")
     parser.add_argument("--orekit_mass_kg", type=float, default=10.0)
     parser.add_argument("--orekit_drag_cd", type=float, default=2.2)
     parser.add_argument("--orekit_drag_area_m2", type=float, default=0.1)
@@ -254,7 +290,15 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         narx_num_hidden_layers=args.narx_num_hidden_layers,
         narx_activation=args.narx_activation,
         narx_dropout=args.narx_dropout,
+        narx_snake_alpha=args.narx_snake_alpha,
+        narx_prediction_length_sec=args.narx_prediction_length,
         narx_use_velocity_input=args.narx_use_velocity_input,
+        optimizer_name=args.optimizer_name,
+        optimizer_momentum=args.optimizer_momentum,
+        lr_scheduler_name=args.lr_scheduler_name,
+        lr_scheduler_factor=args.lr_scheduler_factor,
+        lr_scheduler_patience=args.lr_scheduler_patience,
+        lr_scheduler_min_lr=args.lr_scheduler_min_lr,
         orekit_mass_kg=args.orekit_mass_kg,
         orekit_drag_cd=args.orekit_drag_cd,
         orekit_drag_area_m2=args.orekit_drag_area_m2,

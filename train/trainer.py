@@ -14,6 +14,7 @@ from models.lstm_model import LSTMEncoderDecoder
 from models.narx_model import NARXForecaster
 from models.tcn_model import TCNForecaster
 from train.losses import composite_sequence_loss, step_mse_loss
+from train.optimizers import Yogi
 
 
 @dataclass
@@ -39,6 +40,7 @@ def build_model(config, history_dim: int, future_dim: int, output_dim: int) -> t
             num_hidden_layers=config.narx_num_hidden_layers,
             activation=config.narx_activation,
             dropout=config.narx_dropout,
+            snake_alpha=config.narx_snake_alpha,
         )
     if config.model_name == "tcn":
         return TCNForecaster(
@@ -136,11 +138,8 @@ def train_model(dataset, config, models_dir: str, logger) -> TrainResult:
         future_dim=sample_future.shape[-1],
         output_dim=output_dim,
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_optimizer(model=model, config=config)
+    scheduler = build_scheduler(optimizer=optimizer, config=config)
 
     best_val = float("inf")
     best_state = copy.deepcopy(model.state_dict())
@@ -153,6 +152,7 @@ def train_model(dataset, config, models_dir: str, logger) -> TrainResult:
         "val_diff": [],
         "train_smooth": [],
         "val_smooth": [],
+        "lr": [],
     }
     best_model_path = os.path.join(models_dir, "best_model.pt")
     epochs_without_improvement = 0
@@ -168,12 +168,17 @@ def train_model(dataset, config, models_dir: str, logger) -> TrainResult:
         history["val_diff"].append(val_stats["diff"])
         history["train_smooth"].append(train_stats["smooth"])
         history["val_smooth"].append(val_stats["smooth"])
+        if scheduler is not None:
+            scheduler.step(val_stats["loss"])
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        history["lr"].append(current_lr)
         logger.info(
-            "Epoch %d/%d | train=%.6f | val=%.6f",
+            "Epoch %d/%d | train=%.6f | val=%.6f | lr=%.6e",
             epoch,
             config.epochs,
             train_stats["loss"],
             val_stats["loss"],
+            current_lr,
         )
 
         if val_stats["loss"] < best_val:
@@ -189,6 +194,58 @@ def train_model(dataset, config, models_dir: str, logger) -> TrainResult:
 
     model.load_state_dict(best_state)
     return TrainResult(model=model, device=device, history=history, best_model_path=best_model_path)
+
+
+def build_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
+    """Build the configured optimizer."""
+    name = config.optimizer_name.lower()
+    if name == "adam":
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    if name == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    if name == "adagrad":
+        return torch.optim.Adagrad(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    if name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=config.learning_rate,
+            momentum=config.optimizer_momentum,
+            weight_decay=config.weight_decay,
+        )
+    if name == "yogi":
+        return Yogi(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer_name: {config.optimizer_name}")
+
+
+def build_scheduler(optimizer: torch.optim.Optimizer, config):
+    """Build the configured learning-rate scheduler."""
+    if config.lr_scheduler_name == "none":
+        return None
+    if config.lr_scheduler_name == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=config.lr_scheduler_factor,
+            patience=config.lr_scheduler_patience,
+            min_lr=config.lr_scheduler_min_lr,
+        )
+    raise ValueError(f"Unsupported lr_scheduler_name: {config.lr_scheduler_name}")
 
 
 def autoregressive_rollout(
@@ -240,17 +297,19 @@ def narx_teacher_forced_rollout(
     device: str,
     exogenous_inputs: np.ndarray,
     feedback_series: np.ndarray,
+    prediction_steps: int,
     config,
     scalers: dict,
 ) -> np.ndarray:
     """Predict the training segment with open-loop NARX feedback from observed history."""
     max_lag = max(config.narx_input_lags, config.narx_feedback_lags)
     predicted = np.zeros_like(feedback_series)
-    predicted[:max_lag] = feedback_series[:max_lag]
+    warmup_end = max_lag + prediction_steps - 1
+    predicted[:warmup_end] = feedback_series[:warmup_end]
     model.eval()
 
     with torch.no_grad():
-        for step in range(max_lag, len(feedback_series)):
+        for step in range(max_lag, len(feedback_series) - prediction_steps + 1):
             exog_window = exogenous_inputs[step - config.narx_input_lags : step]
             feedback_window = feedback_series[step - config.narx_feedback_lags : step]
             x_exog = scalers["narx_input"].transform(exog_window)[None, ...].astype(np.float32)
@@ -259,7 +318,8 @@ def narx_teacher_forced_rollout(
                 torch.from_numpy(x_exog).to(device),
                 torch.from_numpy(x_feedback).to(device),
             ).cpu().numpy()
-            predicted[step] = scalers["target"].inverse_transform(pred_norm)[0]
+            target_index = step + prediction_steps - 1
+            predicted[target_index] = scalers["target"].inverse_transform(pred_norm)[0]
     return predicted
 
 
@@ -269,6 +329,7 @@ def narx_autoregressive_rollout(
     exogenous_inputs_full: np.ndarray,
     feedback_seed_full: np.ndarray,
     forecast_start_index: int,
+    prediction_steps: int,
     config,
     scalers: dict,
     logger,
@@ -281,10 +342,12 @@ def narx_autoregressive_rollout(
     model.eval()
     predicted = feedback_seed_full.copy()
     total_len = len(predicted)
-    progress_interval = max((total_len - forecast_start_index) // 20, 1)
+    first_target_index = max(forecast_start_index, max_lag + prediction_steps - 1)
+    progress_interval = max((total_len - first_target_index) // 20, 1)
 
     with torch.no_grad():
-        for step in range(forecast_start_index, total_len):
+        for target_index in range(first_target_index, total_len):
+            step = target_index - prediction_steps + 1
             exog_window = exogenous_inputs_full[step - config.narx_input_lags : step]
             feedback_window = predicted[step - config.narx_feedback_lags : step]
             x_exog = scalers["narx_input"].transform(exog_window)[None, ...].astype(np.float32)
@@ -293,8 +356,8 @@ def narx_autoregressive_rollout(
                 torch.from_numpy(x_exog).to(device),
                 torch.from_numpy(x_feedback).to(device),
             ).cpu().numpy()
-            predicted[step] = scalers["target"].inverse_transform(pred_norm)[0]
-            completed = step - forecast_start_index + 1
-            if completed % progress_interval == 0 or step == total_len - 1:
-                logger.info("NARX closed-loop rollout progress: %d / %d", step + 1, total_len)
+            predicted[target_index] = scalers["target"].inverse_transform(pred_norm)[0]
+            completed = target_index - first_target_index + 1
+            if completed % progress_interval == 0 or target_index == total_len - 1:
+                logger.info("NARX closed-loop rollout progress: %d / %d", target_index + 1, total_len)
     return predicted
