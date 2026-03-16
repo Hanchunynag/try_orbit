@@ -14,6 +14,7 @@ class ExperimentConfig:
     tle_file: str
     sat_name: Optional[str]
     output_dir: str = "outputs"
+    precomputed_bundle_path: Optional[str] = None
     scenario_start_utc: Optional[str] = None
     orekit_data_path: Optional[str] = None
     receiver_lat_deg: float = 45.772625
@@ -100,6 +101,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tle_file", required=True, help="Path to the TLE file.")
     parser.add_argument("--sat_name", default=None, help="Satellite name to select from TLE.")
     parser.add_argument("--output_dir", default="outputs", help="Output directory.")
+    parser.add_argument(
+        "--precomputed_bundle_path",
+        default=None,
+        help="Optional NPZ bundle with precomputed SGP4/HPOP/RTN residual data. Useful for sweeps that reuse the same scenario.",
+    )
     parser.add_argument(
         "--scenario_start_utc",
         default=None,
@@ -246,6 +252,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         tle_file=args.tle_file,
         sat_name=args.sat_name,
         output_dir=args.output_dir,
+        precomputed_bundle_path=args.precomputed_bundle_path,
         scenario_start_utc=args.scenario_start_utc,
         orekit_data_path=args.orekit_data_path,
         receiver_lat_deg=args.receiver_lat,

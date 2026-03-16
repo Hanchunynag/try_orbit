@@ -14,8 +14,10 @@ import sys
 import time
 from typing import Any
 
-from config import build_arg_parser
+from config import build_arg_parser, config_from_args
+from data.scenario_bundle import build_scenario_bundle, save_scenario_bundle
 from utils.io_utils import save_json
+from utils.logging_utils import setup_logger
 
 
 DEFAULT_ACTIVATIONS = ["linear", "relu", "tanh", "sigmoid", "snake"]
@@ -145,6 +147,7 @@ def save_manifest(
     sweep_args: argparse.Namespace,
     base_main_args: list[str],
     base_main_namespace: argparse.Namespace,
+    shared_bundle_path: str | None = None,
 ) -> None:
     """Save the sweep manifest for resume/reproducibility."""
     payload = {
@@ -152,6 +155,7 @@ def save_manifest(
         "sweep_args": vars(sweep_args),
         "base_main_args": base_main_args,
         "base_main_config": vars(base_main_namespace),
+        "shared_precomputed_bundle_path": shared_bundle_path,
         "trials": trials,
     }
     save_json(payload, str(manifest_path))
@@ -183,6 +187,7 @@ def objective_value(objective_name: str, metrics: dict[str, Any]) -> float:
 def trial_command(
     repo_root: Path,
     base_main_args: list[str],
+    precomputed_bundle_path: Path,
     trial_dir: Path,
     trial: dict[str, Any],
 ) -> list[str]:
@@ -193,6 +198,8 @@ def trial_command(
         *base_main_args,
         "--model_name",
         "narx",
+        "--precomputed_bundle_path",
+        str(precomputed_bundle_path),
         "--output_dir",
         str(trial_dir),
         "--narx_activation",
@@ -206,6 +213,36 @@ def trial_command(
         "--optimizer_name",
         str(trial["optimizer_name"]),
     ]
+
+
+def resolve_shared_bundle_path(sweep_root: Path, base_main_namespace: argparse.Namespace) -> Path:
+    """Resolve the bundle path used across all sweep trials."""
+    if base_main_namespace.precomputed_bundle_path:
+        return Path(base_main_namespace.precomputed_bundle_path).expanduser().resolve()
+    return (sweep_root / "shared" / "scenario_bundle.npz").resolve()
+
+
+def ensure_shared_bundle(
+    base_main_namespace: argparse.Namespace,
+    shared_bundle_path: Path,
+) -> Path:
+    """Build the shared propagation/residual bundle once, or reuse an existing copy."""
+    if shared_bundle_path.exists():
+        print(f"[precompute] reusing shared scenario bundle: {shared_bundle_path}")
+        return shared_bundle_path
+
+    shared_root = shared_bundle_path.parent
+    shared_root.mkdir(parents=True, exist_ok=True)
+    shared_cache_dir = shared_root / "cache"
+    shared_cache_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(str(shared_root), logger_name="orbit_sweep_precompute")
+    base_config = config_from_args(base_main_namespace)
+    logger.info("Building shared scenario bundle for sweep reuse.")
+    bundle = build_scenario_bundle(config=base_config, cache_dir=str(shared_cache_dir), logger=logger)
+    save_scenario_bundle(bundle, str(shared_bundle_path))
+    logger.info("Saved shared scenario bundle to %s", shared_bundle_path)
+    print(f"[precompute] saved shared scenario bundle: {shared_bundle_path}")
+    return shared_bundle_path
 
 
 def save_results_csv(rows: list[dict[str, Any]], path: Path) -> None:
@@ -224,12 +261,25 @@ def save_results_csv(rows: list[dict[str, Any]], path: Path) -> None:
         writer.writerows(rows)
 
 
-def run_trial(repo_root: Path, base_main_args: list[str], trial_root: Path, trial: dict[str, Any], objective_name: str) -> dict[str, Any]:
+def run_trial(
+    repo_root: Path,
+    base_main_args: list[str],
+    precomputed_bundle_path: Path,
+    trial_root: Path,
+    trial: dict[str, Any],
+    objective_name: str,
+) -> dict[str, Any]:
     """Run one trial and return the summary row."""
     trial_id = f"trial_{trial['trial_index']:03d}"
     trial_dir = trial_root / trial_id
     trial_dir.mkdir(parents=True, exist_ok=True)
-    command = trial_command(repo_root=repo_root, base_main_args=base_main_args, trial_dir=trial_dir, trial=trial)
+    command = trial_command(
+        repo_root=repo_root,
+        base_main_args=base_main_args,
+        precomputed_bundle_path=precomputed_bundle_path,
+        trial_dir=trial_dir,
+        trial=trial,
+    )
     started_at = time.time()
     completed = subprocess.run(
         command,
@@ -293,6 +343,7 @@ def main() -> None:
     results_json_path = sweep_root / "results.json"
     results_csv_path = sweep_root / "results.csv"
     best_json_path = sweep_root / "best_trial.json"
+    shared_bundle_path = resolve_shared_bundle_path(sweep_root=sweep_root, base_main_namespace=base_main_namespace)
 
     if manifest_path.exists():
         if not sweep_args.sweep_resume:
@@ -315,7 +366,13 @@ def main() -> None:
             sweep_args=sweep_args,
             base_main_args=main_arg_tokens,
             base_main_namespace=base_main_namespace,
+            shared_bundle_path=str(shared_bundle_path),
         )
+
+    ensure_shared_bundle(
+        base_main_namespace=base_main_namespace,
+        shared_bundle_path=shared_bundle_path,
+    )
 
     existing_rows: dict[str, dict[str, Any]] = {}
     if results_json_path.exists() and sweep_args.sweep_resume:
@@ -338,6 +395,7 @@ def main() -> None:
         row = run_trial(
             repo_root=repo_root,
             base_main_args=main_arg_tokens,
+            precomputed_bundle_path=shared_bundle_path,
             trial_root=trial_root,
             trial=trial,
             objective_name=sweep_args.sweep_objective,
